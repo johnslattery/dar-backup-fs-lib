@@ -1,0 +1,326 @@
+#!/bin/bash
+# Source this file from a script that looks something like the following:
+# #!/bin/bash
+# 
+# # Dir on the nas backup share where the archive should be created.
+# nasbackupdir="kristine-note/fs"
+# 
+# # Options and user targets to be passed to dar. Don't specify command options.
+# # Assume --create and a file name have been provided. Don't specify --ref. The
+# # script will decide when to do a differential backup unless options are
+# # specified that override its solution, forcing a full or incremental backup.
+# darargs="--fs-root "/home" \
+# 	--prune "*/.cache" \
+# 	--prune "*/.thumbnails" \
+# 	--prune "*/.mozilla" \
+# 	--empty-dir \
+# 	--bzip2 \
+#	--mincompr 256
+# 	--exclude-compression "*.7z" \
+# 	--exclude-compression "*.zip" \
+# 	--exclude-compression "*.gz" \
+# 	--exclude-compression "*.bz2" \
+# 	--exclude-compression "*.[jJ][pP][gG]" \
+# 	--exclude-compression "*.[aA][vV][iI]" \
+# 	--exclude-compression "*.[wW][mM][aA]" \
+# 	--exclude-compression "*.[mM][pP]3" \
+# 	--quiet \
+# 	-Q"
+# 
+# source backup-fs-lib
+# backup "$@"
+
+function datetoseconds () {
+	echo "$(date --date="$1" +%s)"
+}
+
+function secondstodate () {
+	echo "$(date --date="1970-01-01 $1 sec" --utc)"
+}
+
+function archivemoment () {
+	echo "$(date --date="$(secondstodate "$1")" \
+		--utc +%Y%m%dT%H%M%SZ)"
+}
+
+function isarchiverooted () {
+
+	local archivetoverify="$1"
+	local momenttoverify=""
+	local archiveidx="0"
+	local archive=""
+	local moment=""
+	local refmoment=""
+	local retval=1
+
+	if [[ $archivetoverify =~ ^$basenamergx ]]
+	then
+		momenttoverify=${bash_rematch[1]}
+		moment="$momenttoverify"
+
+		until [[ "$momenttoverify" > "$moment" ]]
+		do
+			archive=${archives[archiveidx++]}
+			if [[ $archive =~ ^$basenamergx$ ]]
+			then
+				moment=${bash_rematch[1]}
+				refmoment=${bash_rematch[4]}
+
+				if [[ $momenttoverify == $moment ]]
+				then
+					if [[ -z  $refmoment ]]
+					then
+
+						# this a full archive
+						retval="0"
+						break
+
+					else
+
+						# this is a differential archive, so we keep
+						# looking for the full backup that started
+						# the series
+						momenttoverify="$refmoment"
+
+					fi
+				fi
+			fi
+		done
+	fi
+
+	return "$retval"
+}
+
+function darbackup () {
+
+	local args="$1"
+	local archive="$2"
+	local refarchive="$3"
+	local stderr=""
+	
+	args="--create "$archive" $args"
+
+	if [[ -n "$refarchive" ]]
+	then
+		args+=" --ref "$refarchive""
+	fi
+
+	if ! stderr="$(dar $args 2>&1)"
+	then
+		echo "dar failed"
+		echo "$stderr"
+		exitstatus="$?"
+	fi
+}
+
+function version() {
+
+	# version statement
+	# http://www.gnu.org/prep/standards/standards.html#Command_002dLine-Interfaces
+	
+	printf "\
+backup-fs 0.9
+Copyright (C) 2012 John Slattery
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it
+There is NO WARRANTY, to the extent permitted by law.
+"
+}
+
+function help () {
+
+	# help statement
+	# http://www.gnu.org/prep/standards/standards.html#Command_002dLine-Interfaces
+
+	printf "\
+Usage: $0 [OPTION]...
+Backup file system elements with the excellent Disk Archiver
+<http://dar.linux.free.fr/> (DAR). The assumption is that the script will
+typically be run without options on a daily basis. It will then determine
+whether or not to do a full or differential backup based on the current date.  A
+full backup will occur on the first of the month; on other dates a differential
+backup will occur. If a differential backup is indicated, a check will be made
+to assure that the referenced archive or an ancestor is a full backup. If that's
+not the case a full backup will occur. Archive base names will be created from
+the current moment UTC in short ISO 8601 form--'yyyymmddThhmmssZ'--followed by a
+similar date expression for the moment of a referenced archive, if any,
+separated by the current value of \$basenamedelim. A full backup base name would
+be 20120206T120000Z.  A differential backup referencing it would be
+20120206T120001Z\$basenamedelim20120206T120000Z. A second differential backup
+referencing the first differential backup would be
+20120206T120002Z\$basenamedelim20120206T120001Z. Options allow overriding the
+automatic selection of backup type, base name, and reference base name.
+Specifying a reference base name with a full backup will cause the script to
+exit with an error.
+
+Mandatory arguments to long options are mandatory for short options too.
+  -m, --moment=NAME         the base file name for the DAR archive (may include
+                              path)
+  -r, --ref-archive=NAME    the base file name and of a DAR archive to reference
+                              for a differential backup (may include path)
+  -t, --backup-type=DIFF|FULL
+                            the backup type, either diff (differential) or full
+      --help                display this help and exit
+      --version             output version information and exit
+
+Exit status:
+ 0 if OK,
+ 1 if not OK.
+
+Report bugs to: <https://github.com/johnslattery/backup-fs/issues>
+backup-fs home page: <https://github.com/johnslattery/backup-fs>
+General help using GNU software: <http://www.gnu.org/gethelp/>
+"
+}
+
+function backup ()
+{
+	local args="$1"
+
+	opt=""
+	type=""
+	typediff="diff"
+	typefull="full"
+	moment=""
+	refarchive=""
+	nowseconds="$(datetoseconds "$(date --utc)")"
+	exitstatus="0"
+	mnt="/mnt/nas-backup"
+	mntstatus="false"
+	# nasbackupdir is specified in the sourcing script
+	archivedir="$mnt/$nasbackupdir"
+	iso8601momentrgx="[0-9]{4}[0-1][0-9][0-3][0-9]T[0-2][0-9]([0-5][0-9]){2}Z"
+	dartailrgx="\.[0-9]+\.dar"
+	basenamedelim="_"
+	basenamergx="($iso8601momentrgx)($basenamedelim($iso8601momentrgx))?"
+	filergx="^$archivedir/$basenamergx$dartailrgx$"
+	archives=""
+	archive=""
+	i="0"
+
+	# get command line options
+	# derived from http://stackoverflow.com/questions/402377/using-getopts-in-bash-shell-script-to-get-long-and-short-command-line-options
+	opt="$(getopt -o m:r:t \
+		--long help,version,moment:,ref-archive:,backup-type: -n "$0" -- ${1+"$args"})"
+	if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
+	eval set -- "$opt"
+	while true
+	do
+		case "$1" in
+			--help )
+				help
+				exit
+				;;
+			--version )
+				version
+				exit
+				;;
+			-m | --moment )
+				moment="$2"
+				shift 2
+				;;
+			-r | --ref-archive )
+				refarchive="$2"
+				shift 2
+				;;
+			-t | --backup-type )
+				case "$2" in
+					"$typediff" | "$typefull" )
+						type="$2"
+						shift 2
+						;;
+					* )
+						echo "--backup-type (-t) must be 'diff' or 'full'." >&2
+						exit 1
+						;;
+				esac
+				;;
+			-- )
+				shift
+				break
+				;;
+			* )
+				# this should never run as getopt should trap
+				echo "Unknown option '$1'." >&2
+				exit 1
+				;;
+		esac
+	done
+
+	# check options
+	if [[ "$type" != "$typediff"  && -n "$refarchive" ]]
+	then
+		echo "--ref-archive is not consistent with any --type except 'diff'." >&2
+		exit 1
+	fi
+
+	# type
+	if [[ -z $type ]]
+	then
+		case $(date --date="$(secondstodate $nowseconds)" +%-d) in
+			1 )
+				type="$typefull"
+				;;
+			* )
+				type="$typediff"
+				;;
+		esac
+	fi
+
+	# moment
+	if [[ -z $moment ]]
+	then
+		moment="$(archivemoment "$nowseconds")"
+	fi
+
+	# mount the archive share and remember its mounted status
+	if mountpoint -q "$mnt"
+	then
+		mntstatus=true
+	else
+		mntstatus=false
+		mount "$mnt"
+	fi
+
+	while read archive
+	do
+		archive="${archive#"$archivedir/"}"
+		archives[i++]="${archive%%.*}"
+	done < <(find "$archivedir" -type f -regextype posix-extended \
+		-regex "$filergx" | LC_COLLATE=C sort --reverse --unique)
+
+	# reference moment
+	if [[ -z $refarchive && $type=$typediff ]]
+	then
+		refarchive="${archives[0]}"
+	fi
+
+	# backup
+	case "$type" in
+		"$typefull" )
+			# darargs is specified in the sourcing script
+			darbackup "$darargs" "$archivedir/$moment"
+			;;
+		"$typediff" )
+			if isarchiverooted $refarchive
+			then
+				if [[ $refarchive =~ ^$basenamergx$ ]]
+				then
+					# darargs is specified in the sourcing script
+					darbackup "$darargs" "$archivedir/$moment$basenamedelim${BASH_REMATCH[1]}" "$archivedir/$refarchive"
+				fi
+			else
+				# darargs is specified in the sourcing script
+				darbackup "$darargs" "$archivedir/$moment"
+			fi
+			;;
+	esac
+
+	# unmount the archive share for writing backups
+	if ! $mntstatus
+	then
+		umount "$mnt"
+	fi
+
+	exit "$exitstatus"
+}
